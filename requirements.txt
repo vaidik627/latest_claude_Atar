@@ -5,3 +5,9 @@ python-dotenv
 proto-plus
 pypdf
 openai
+
+# Rule-based extraction dependencies
+pandas
+fuzzywuzzy[speedup]
+python-Levenshtein
+regex

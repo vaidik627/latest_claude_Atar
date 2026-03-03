@@ -223,12 +223,12 @@ def _get_layout_text(layout, full_text):
 
 
 def _start_extraction(doc_id, processed_text_path):
-    """Launch AI extraction in a new background thread."""
-    from services.extraction_service import extract_document_financials
+    """Launch rule-based extraction in a new background thread."""
+    from services.rule_based_extraction_service import extract_document_financials
     thread = threading.Thread(
         target=extract_document_financials,
         args=(doc_id, processed_text_path),
         daemon=True
     )
     thread.start()
-    print(f"[OCR] doc_id={doc_id}: AI extraction thread started")
+    print(f"[OCR] doc_id={doc_id}: Rule-based extraction thread started")

@@ -7,7 +7,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from database import get_db, init_db
 from services.ocr_service import process_document_ocr
-from services.extraction_service import extract_document_financials
+from services.rule_based_extraction_service import extract_document_financials
 
 load_dotenv()
 
