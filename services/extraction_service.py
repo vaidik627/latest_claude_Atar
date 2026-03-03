@@ -139,12 +139,115 @@ COMPANY INFO
   - If only 3-4 projection years exist: ["Y1","Y2","Y3",null,null]
 
 ══════════════════════════════════════
+REVENUE EXTRACTION — ANTI-SEGMENT-TABLE RULES
+══════════════════════════════════════
+
+CRITICAL: Revenue is the LARGEST number in the P&L and must be extracted from
+the CONSOLIDATED table, NOT segment/division breakdowns.
+
+STEP 1 — IDENTIFY SEGMENT vs CONSOLIDATED TABLES:
+
+  WRONG TABLE - Segment Breakdown (DO NOT USE):
+    Industrial Revenue    $ 66,411  $ 50,723  $ 45,474
+    Consumer Revenue       93,922    75,114
+    Total Revenue        $160,333  $125,837  $ 92,452  ← USE THIS ROW ONLY
+
+  RIGHT TABLE - Consolidated P&L:
+    Total Revenue        $125,837  $ 99,086  $ 92,452
+    Cost of Goods Sold   (71,763)  (58,406)  (55,609)
+    Gross Profit         $ 54,074  $ 40,680  $ 36,843
+
+  DETECTION RULES:
+  - If you see rows labeled "Industrial", "Consumer", "Division A", "Segment X"
+    followed by "Total Revenue" → you are in a SEGMENT TABLE
+  - Skip those segment rows and extract ONLY from "Total Revenue" row
+  - The "Total Revenue" row sums all segments and is the ONLY correct value
+
+STEP 2 — EXTRACT ALL YEAR COLUMNS:
+
+  For EVERY row you extract, return a value for EVERY year column.
+
+  Example table:
+    Row Label       Dec-23A   Dec-24A   Dec-25A
+    Total Revenue   $125,837  $ 92,452  $ 96,100
+
+  CORRECT:   [125837, 92452, 96100]  ✓ All 3 years extracted
+  WRONG:     [125837, null, null]    ❌ Only 1 year extracted
+  WRONG:     [50723, 45474, 47714]   ❌ Segment values instead of totals
+
+STEP 3 — MANDATORY PRE-RETURN VALIDATION:
+
+  Before returning revenue values, verify ALL of these checks PASS:
+
+  CHECK 1: Revenue > Gross Profit (MOST CRITICAL)
+    Gross Profit = Revenue - COGS
+    Therefore: Revenue MUST be > GP for EVERY year
+
+    If Revenue < GP for ANY year:
+    → YOU EXTRACTED FROM A SEGMENT ROW, NOT THE TOTAL ROW
+    → Re-read the table and find "Total Revenue" or "Consolidated Revenue"
+
+    Example of FAILED check:
+      net_revenue_hist: [50723, 45474, 47714]   ← Too low
+      gross_profit_hist: [54074, 40680, 36843]  ← GP > Revenue in year 0!
+      Gross Margin = 54074 / 50723 = 106.6%    ← IMPOSSIBLE (GM > 100%)
+
+  CHECK 2: Gross Margin between 10-90%
+    Gross Margin % = Gross Profit / Revenue
+    Typical range for PE targets: 20-70%
+
+    If GM% > 100%: Revenue is from segment table (CRITICAL ERROR)
+    If GM% < 10%: Gross Profit may be wrong (unusual)
+    If GM% > 90%: Unusual but possible for software/IP companies
+
+  CHECK 3: Revenue > SG&A
+    SG&A is typically 15-50% of revenue
+
+    If Revenue < SG&A: Revenue is from segment table, not consolidated
+
+  CHECK 4: Revenue > EBITDA
+    EBITDA is typically 5-30% of revenue
+
+    If Revenue < EBITDA: Revenue extraction failed
+
+  CHECK 5: Revenue magnitude check
+    For PE targets: Revenue typically $30M-$500M ($30,000-$500,000 in $000s)
+
+    If Revenue < $10M and company is described as "market leader":
+    → You likely extracted a segment, not total
+
+    Cross-check: Consolidated revenue should be 2-5x larger than any single segment
+
+STEP 4 — IF VALIDATION FAILS:
+
+  If ANY check fails:
+  1. Search for "Total Revenue", "Net Revenue", "Consolidated Revenue" row label
+  2. Ensure you're NOT reading from a segment breakdown section
+  3. Look for the LARGEST revenue numbers in the P&L
+  4. Verify: Consolidated Total > Sum of Segments
+  5. Extract ALL year columns from that row
+
+CROSS-CHECK AFTER EXTRACTION:
+  After extracting both Revenue and Gross Profit, verify:
+    Gross Margin = GP / Revenue for EACH year
+    Expected range: 0.10 to 0.90 (10% to 90%)
+
+  If GM > 1.0 (100%):
+    → CRITICAL ERROR: You extracted SEGMENT revenue instead of TOTAL
+    → Return to table and find "Total Revenue" row
+    → Re-extract using that row
+
+══════════════════════════════════════
 P&L FIELDS — HISTORICAL (3 values, oldest→newest)
 ══════════════════════════════════════
 
-  net_revenue_hist: "Net Revenue", "Total Revenue", "Net Sales"
-  - This is the LARGEST number in each column of the main P&L
-  - For PE targets, revenue is typically $30M-$500M
+  net_revenue_hist: "Total Revenue", "Net Revenue", "Consolidated Revenue", "Net Sales"
+  - This is the LARGEST number in each column of the CONSOLIDATED P&L
+  - Must be greater than Gross Profit, SG&A, and EBITDA for EVERY year
+  - For PE targets, revenue is typically $30M-$500M ($30,000-$500,000 in $000s)
+  - WARNING: Do NOT extract from segment/division tables (Industrial, Consumer, etc.)
+  - ALWAYS use "Total Revenue" or "Consolidated Revenue" row
+  - VALIDATION: Gross Margin (GP/Revenue) must be 10-90%, not >100%
 
   gross_profit_hist: "Gross Profit", "Gross Margin $"
   - If not found return [null,null,null]
@@ -530,6 +633,16 @@ def check_and_fix_row_swaps(data):
     IMPORTANT: Only uses SGA for swap logic if SGA passes a sanity check
     (5-60% of revenue). Otherwise the swap would corrupt EBITDA.
     """
+    # Check if revenue validation failed - if so, skip row swaps
+    # Revenue errors corrupt ALL P&L ratios, making swap detection unreliable
+    revenue_corrections = data.get("_revenue_corrections", [])
+    has_revenue_error = any("REVENUE ERROR" in err for err in revenue_corrections)
+
+    if has_revenue_error:
+        print("[ROW SWAP] Skipping - revenue validation failed. "
+              "Swapping EBITDA when revenue is wrong would create cascade errors.")
+        return data
+
     f = data.get("financials", {})
     gp_h = f.get("gross_profit_hist", [None] * 3)
     sga_h = f.get("sga_hist", [None] * 3)
@@ -638,6 +751,211 @@ def check_revenue_completeness(data):
         for fix in fixes:
             print(f"  -> {fix}")
         data.setdefault("_derivations_applied", []).extend(fixes)
+
+    return data
+
+
+def validate_revenue_accuracy(data):
+    """
+    Validates that revenue values satisfy fundamental accounting rules.
+    Runs FIRST in the pipeline to detect segment-table confusion.
+
+    VALIDATION HIERARCHY (must ALL pass):
+    1. Revenue > Gross Profit for every year (GM cannot exceed 100%)
+    2. Revenue > SG&A for every year (must be at least 2x SG&A)
+    3. Revenue > EBITDA for every year (EBITDA is a profit metric)
+    4. Reasonable growth rates (-50% to +100% per year)
+    5. Historical→Projection transition is reasonable
+
+    AUTO-FIX STRATEGY:
+    - If GP > Revenue by >50%: Likely values swapped, swap them
+    - If GP > Revenue by 10-50%: Flag error, no auto-fix (ambiguous)
+    - If growth >100% or <-50%: Flag for review
+    - If SG&A > Revenue: Flag error (segment revenue used)
+
+    Returns:
+        Updated data dict with corrections in _revenue_corrections array
+    """
+    f = data.get("financials", {})
+    corrections = []
+
+    rev_h = f.get("net_revenue_hist", [None] * 3)
+    gp_h = f.get("gross_profit_hist", [None] * 3)
+    sga_h = f.get("sga_hist", [None] * 3)
+    ebitda_h = f.get("adj_ebitda_hist", [None] * 3)
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 1: Revenue > Gross Profit (CRITICAL)
+    # ═══════════════════════════════════════════════
+    for i in range(min(3, len(rev_h))):
+        if rev_h[i] is None or gp_h[i] is None:
+            continue
+
+        gm_pct = gp_h[i] / rev_h[i] if rev_h[i] > 0 else 999
+
+        # CASE 1: GM > 100% (Revenue < GP) - IMPOSSIBLE
+        if gm_pct > 1.0:
+            corrections.append(
+                f"REVENUE ERROR hist[{i}]: Gross Margin = {gm_pct:.1%} (Revenue={rev_h[i]:,}, "
+                f"GP={gp_h[i]:,}) - IMPOSSIBLE. Gross Profit cannot exceed Revenue. "
+                f"This indicates revenue was extracted from a SEGMENT row instead of TOTAL REVENUE row."
+            )
+
+            # AUTO-FIX: If GP is significantly larger (>50%), swap them
+            if gp_h[i] > rev_h[i] * 1.5:
+                old_rev = rev_h[i]
+                old_gp = gp_h[i]
+                rev_h[i] = old_gp  # Use GP as revenue
+                gp_h[i] = old_rev  # Use old revenue as GP
+                corrections.append(
+                    f"AUTO-FIX hist[{i}]: Swapped Revenue and Gross Profit. "
+                    f"New: Revenue={rev_h[i]:,}, GP={gp_h[i]:,} (GM={(gp_h[i]/rev_h[i]):.1%})"
+                )
+            else:
+                # Difference is small - flag but don't auto-fix (too risky)
+                corrections.append(
+                    f"MANUAL REVIEW REQUIRED hist[{i}]: GP > Revenue but difference is <50%. "
+                    f"Cannot auto-fix safely. Check OCR for 'Total Revenue' vs segment revenue. "
+                    f"Expected: Consolidated revenue should be 2-3x larger than segment revenue."
+                )
+
+        # CASE 2: GM < 10% - Suspiciously low
+        elif gm_pct < 0.10:
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: Gross Margin = {gm_pct:.1%} is very low. "
+                f"Typical range: 20-70%. Verify Revenue and GP values are correct."
+            )
+
+        # CASE 3: GM > 90% - Suspiciously high (but not impossible)
+        elif gm_pct > 0.90:
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: Gross Margin = {gm_pct:.1%} is very high. "
+                f"Verify this is accurate (some software/IP companies have 90%+ margins)."
+            )
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 2: Revenue > SG&A
+    # ═══════════════════════════════════════════════
+    for i in range(min(3, len(rev_h))):
+        if rev_h[i] is None or sga_h[i] is None:
+            continue
+
+        sga_ratio = sga_h[i] / rev_h[i] if rev_h[i] > 0 else 999
+
+        if rev_h[i] < sga_h[i]:
+            corrections.append(
+                f"REVENUE ERROR hist[{i}]: Revenue({rev_h[i]:,}) < SG&A({sga_h[i]:,}) - "
+                f"IMPOSSIBLE for a viable business. Revenue is likely from a SEGMENT table, "
+                f"not consolidated P&L. Search OCR for 'Total Revenue' or 'Consolidated Revenue' row."
+            )
+        elif sga_ratio > 0.60:
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: SG&A/Revenue = {sga_ratio:.1%} is very high. "
+                f"Typical range: 15-50%. Verify values or check for segment revenue."
+            )
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 3: Revenue > EBITDA
+    # ═══════════════════════════════════════════════
+    for i in range(min(3, len(rev_h))):
+        if rev_h[i] is None or ebitda_h[i] is None:
+            continue
+
+        ebitda_margin = ebitda_h[i] / rev_h[i] if rev_h[i] > 0 else 999
+
+        if rev_h[i] < ebitda_h[i]:
+            corrections.append(
+                f"REVENUE ERROR hist[{i}]: Revenue({rev_h[i]:,}) < EBITDA({ebitda_h[i]:,}) - "
+                f"IMPOSSIBLE. Revenue extracted from wrong table row."
+            )
+        elif ebitda_margin > 0.45:
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: EBITDA/Revenue = {ebitda_margin:.1%} is very high. "
+                f"Typical range: 5-30%. Verify values."
+            )
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 4: Historical revenue growth rates
+    # ═══════════════════════════════════════════════
+    for i in range(1, min(3, len(rev_h))):
+        if rev_h[i] is None or rev_h[i-1] is None or rev_h[i-1] == 0:
+            continue
+
+        growth = (rev_h[i] - rev_h[i-1]) / rev_h[i-1]
+
+        if growth > 1.00:  # >100% growth
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: YoY growth = {growth:.1%} is extremely high. "
+                f"Verify revenue values (year {i-1}: {rev_h[i-1]:,} → year {i}: {rev_h[i]:,}). "
+                f"Check for segment vs total revenue confusion."
+            )
+        elif growth < -0.50:  # >50% decline
+            corrections.append(
+                f"REVENUE WARNING hist[{i}]: YoY decline = {growth:.1%} is very steep. "
+                f"Verify revenue values."
+            )
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 5: Projection revenue growth rates
+    # ═══════════════════════════════════════════════
+    rev_p = f.get("net_revenue_proj", [None] * 5)
+    for i in range(1, min(5, len(rev_p))):
+        if rev_p[i] is None or rev_p[i-1] is None or rev_p[i-1] == 0:
+            continue
+
+        proj_growth = (rev_p[i] - rev_p[i-1]) / rev_p[i-1]
+
+        if proj_growth > 0.50:  # >50% growth in projections
+            corrections.append(
+                f"REVENUE WARNING proj[{i}]: Projected growth = {proj_growth:.1%} is very high. "
+                f"Verify projection values."
+            )
+        elif proj_growth < -0.30:  # >30% decline in projections
+            corrections.append(
+                f"REVENUE WARNING proj[{i}]: Projected decline = {proj_growth:.1%} is steep. "
+                f"Verify projection values."
+            )
+
+    # ═══════════════════════════════════════════════
+    # VALIDATION 6: Historical → Projection transition
+    # ═══════════════════════════════════════════════
+    if len(rev_h) > 2 and len(rev_p) > 0 and rev_h[2] and rev_p[0]:
+        ltm_to_y1_growth = (rev_p[0] - rev_h[2]) / rev_h[2]
+
+        if ltm_to_y1_growth > 0.75:  # >75% jump from LTM to Year 1
+            corrections.append(
+                f"REVENUE WARNING: LTM→Year1 growth = {ltm_to_y1_growth:.1%} is very high. "
+                f"Verify transition from historical ({rev_h[2]:,}) to projection ({rev_p[0]:,})."
+            )
+
+    # Apply corrections to data
+    f["net_revenue_hist"] = rev_h
+    f["gross_profit_hist"] = gp_h
+    data["financials"] = f
+
+    # Log corrections and update confidence
+    if corrections:
+        print(f"[REVENUE VALIDATION] {len(corrections)} issues found:")
+        for c in corrections:
+            print(f"  >> {c}")
+
+        data.setdefault("_revenue_corrections", []).extend(corrections)
+
+        # Lower confidence if revenue errors exist
+        has_critical_error = any("REVENUE ERROR" in c for c in corrections)
+        if has_critical_error:
+            conf = data.get("confidence", {})
+            conf["field_level"] = conf.get("field_level", {})
+            conf["field_level"]["net_revenue"] = "low"
+            conf["overall_confidence"] = min(conf.get("overall_confidence", 100), 40)
+            data["confidence"] = conf
+
+            # Flag for manual review
+            data.setdefault("_requires_manual_review", []).append(
+                "Revenue extraction failed fundamental validation - likely segment vs total confusion"
+            )
+    else:
+        print(f"[REVENUE VALIDATION] All checks passed OK")
 
     return data
 
@@ -1386,7 +1704,12 @@ def extract_document_financials(doc_id, ocr_text_path):
         # Parse and validate
         extraction_data = json.loads(extraction_json)
 
+        # 0. REVENUE VALIDATION - Must run FIRST before other corrections
+        #    Detects segment-table confusion and prevents downstream errors
+        extraction_data = validate_revenue_accuracy(extraction_data)
+
         # 1. INTEGRITY: fix row swaps (EBITDA vs Operating Income confusion)
+        #    Note: Skipped if revenue validation failed (prevents cascade errors)
         extraction_data = check_and_fix_row_swaps(extraction_data)
 
         # 2. INTEGRITY: infer missing revenue from GP + known GM%
